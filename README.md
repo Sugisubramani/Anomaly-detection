@@ -1,25 +1,31 @@
 # Honeywell Hackathon – Multivariate Time-Series Anomaly Detection
 
-## Quick Start
-```bash
-# 1) Create & activate virtual env (Windows PowerShell)
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-# macOS/Linux
-python3 -m venv .venv
-source .venv/bin/activate
+## What it does
+I built a PCA-based anomaly detector for multivariate time-series data.  
+It learns the "normal" behavior from the **training window** (Jan 1–5, 2004),  
+then scores the **analysis window** (Jan 6–10, 2004) to find anomalies.
 
-# 2) Install requirements
+**Output:**  
+- Original dataset columns  
+- + 8 new columns:  
+  - `Abnormality_score` (0–100 severity)  
+  - `top_feature_1 … top_feature_7` (main contributing features per row, padded with `""` if fewer than 7 contribute)
+
+## Why this works
+- **PCA (Principal Component Analysis):** captures the normal correlations among variables.  
+- **Reconstruction error:** if variables deviate from their usual relationships, the error grows → anomaly.  
+- **Percentile scaling (0–100):** makes scores comparable and interpretable.  
+- **Top contributors:** we report the features that explain >1% of the anomaly, so you can see *why* a row is abnormal.
+
+This covers all three anomaly types in the spec:
+- Threshold violations (large deviations in a single variable)  
+- Relationship changes (correlations break down)  
+- Pattern deviations (temporal structure shifts)
+
+## How to run
+Requirements:
 pip install -r requirements.txt
 
-# 3) Run
+Then run:
 python src/main.py --input data/TEP_Train_Test.csv --output outputs/TEP_with_scores.csv
-```
-
-## What it does
-- Trains on 2004-01-01 00:00 to 2004-01-05 23:59 (normal period).
-- Scores 2004-01-06 00:00 to 2004-01-10 07:59 (analysis).
-- Outputs 8 new columns: Abnormality_score + top_feature_1..7.
-
-See `docs/outline.md` for the write-up you can paste into the submission form.
-
+This produces outputs/TEP_with_scores.csv with the 8 new columns.
