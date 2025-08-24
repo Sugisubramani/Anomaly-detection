@@ -26,6 +26,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
+import warnings
 
 # ------------------------------
 # Type aliases
@@ -323,4 +324,110 @@ def ensemble_percentiles(
     q = np.asarray(if_pct, dtype=np.float64)
     if p.shape != q.shape:
         raise ValueError("pca_pct and if_pct must have the same shape.")
-    return ((1.0 - w) * p + w * q).astype(np.float64)
+    return ((1.0 - w) * p + w * q).astype(np.float64) 
+
+class ThresholdDetector:
+    """Simple z-score threshold anomaly detector.
+
+    Flags samples where one or more features exceed mean ± 3σ (from training).
+    Score is normalized to [0, 1] based on max z-score observed.
+    """
+
+    def __init__(self, z_thresh: float = 3.0):
+        self.z_thresh = float(z_thresh)
+        self.means_: Optional[np.ndarray] = None
+        self.stds_: Optional[np.ndarray] = None
+        self.max_z_: float = 1.0
+
+    def fit(self, X_train: FloatArray) -> None:
+        X = np.asarray(X_train, dtype=np.float64)
+        self.means_ = X.mean(axis=0)
+        self.stds_ = np.where(X.std(axis=0) == 0, 1.0, X.std(axis=0))
+
+    def score_raw(self, X_all: FloatArray) -> FloatArray:
+        if self.means_ is None or self.stds_ is None:
+            raise RuntimeError("ThresholdDetector not fitted.")
+        X = np.asarray(X_all, dtype=np.float64)
+        zscores = np.abs((X - self.means_) / self.stds_)
+        max_z = zscores.max(axis=1)
+        self.max_z_ = max(self.max_z_, max_z.max())
+        return (max_z / self.max_z_).clip(0, 1).astype(np.float64)
+
+class CorrelationDetector:
+    """Detect anomalies via correlation drift from the training baseline.
+
+    - Fits baseline correlation on training data.
+    - For each timestamp, computes rolling-window correlation and compares
+      to baseline; the mean absolute difference is the raw score.
+    - Returns a 0..1 normalized series.
+    """
+
+    def __init__(self, roll_window: int = 60):
+        self.roll_window = int(roll_window)
+        self.base_corr_: Optional[np.ndarray] = None
+        self.n_features_: Optional[int] = None
+
+    def fit(self, X_train: FloatArray) -> None:
+        X = np.asarray(X_train, dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            base = np.corrcoef(X, rowvar=False)
+        self.base_corr_ = np.nan_to_num(base, nan=0.0, posinf=0.0, neginf=0.0)
+        self.n_features_ = X.shape[1]
+
+    def score_raw(self, X_all: FloatArray) -> FloatArray:
+        if self.base_corr_ is None:
+            raise RuntimeError("CorrelationDetector not fitted.")
+        X = np.asarray(X_all, dtype=np.float64)
+        n = X.shape[0]
+        scores = np.zeros(n, dtype=np.float64)
+
+        for i in range(n):
+            start = max(0, i - self.roll_window // 2)
+            end = min(n, i + self.roll_window // 2)
+            window = X[start:end]
+            if window.shape[0] < 5:
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                corr = np.corrcoef(window, rowvar=False)
+            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+            diff = np.abs(corr - self.base_corr_)
+            scores[i] = np.nanmean(diff)
+
+        scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        mx = scores.max()
+        if mx > 0:
+            scores = scores / mx
+        return scores
+
+
+
+def ensemble_multi(
+    scores: List[Optional[FloatArray]], weights: Optional[List[float]] = None
+) -> FloatArray:
+    """Generalized ensemble fusion for multiple detectors.
+
+    Parameters
+    ----------
+    scores : list of FloatArray or None
+        Each detector's percentile scores in [0, 100].
+    weights : list of float, optional
+        Weights (default equal).
+
+    Returns
+    -------
+    FloatArray
+        Weighted average scores in [0, 100].
+    """
+    valid_scores = [np.asarray(s, dtype=np.float64) for s in scores if s is not None]
+    if not valid_scores:
+        return np.array([], dtype=np.float64)
+    if weights is None:
+        weights = [1.0] * len(valid_scores)
+    else:
+        weights = [max(0.0, w) for w in weights]
+    weights = np.array(weights, dtype=np.float64)
+    weights /= weights.sum()
+    stacked = np.vstack(valid_scores)
+    return (weights @ stacked).astype(np.float64)

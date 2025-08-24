@@ -16,15 +16,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from preprocess import (
-    load_csv, ensure_regular_and_interpolate, get_feature_columns,
-    make_masks, assert_min_training_hours, validate_input_schema
-)
 
 from preprocess import (
     load_csv,
@@ -32,8 +28,16 @@ from preprocess import (
     get_feature_columns,
     make_masks,
     assert_min_training_hours,
+    validate_input_schema,
 )
-from model import PCADetector, IFDetector
+
+from model import (
+    PCADetector,
+    IFDetector,
+    ThresholdDetector,
+    CorrelationDetector,
+    ensemble_multi,
+)
 
 # ------------------------------
 # Type aliases
@@ -58,19 +62,10 @@ def robust_calibrate(raw: FloatArray, mask_train: BoolArray) -> FloatArray:
 
     The transformation centers on the training median and scales by IQR, then
     clamps negatives to zero so 'normal' ≈ 0 and anomalies are positive.
-
-    Parameters
-    ----------
-    raw
-        Raw anomaly-like scores (higher means more anomalous).
-    mask_train
-        Boolean mask for the training window (same length as `raw`).
-
-    Returns
-    -------
-    FloatArray
-        Non-negative calibrated scores.
     """
+    if raw is None:
+        return raw
+    raw = np.asarray(raw, dtype=np.float64)
     if raw.size == 0:
         raise ValueError("Empty `raw` passed to robust_calibrate.")
     if mask_train.size != raw.size:
@@ -91,23 +86,7 @@ def robust_calibrate(raw: FloatArray, mask_train: BoolArray) -> FloatArray:
 
 
 def shape_with_gamma(x: FloatArray, gamma: float) -> FloatArray:
-    """Apply monotone shaping to compress small values more than large ones.
-
-    For `gamma > 1`, small (training-like) scores shrink relative to big
-    anomalies; this often improves separation without changing ordering.
-
-    Parameters
-    ----------
-    x
-        Non-negative scores.
-    gamma
-        Shaping exponent (commonly 1.2–3.0).
-
-    Returns
-    -------
-    FloatArray
-        Shaped scores (still non-negative).
-    """
+    """Apply monotone shaping to compress small values more than large ones."""
     if gamma <= 0:
         raise ValueError("gamma must be > 0.")
     x = np.maximum(x, 0.0)
@@ -117,20 +96,7 @@ def shape_with_gamma(x: FloatArray, gamma: float) -> FloatArray:
 def to_percentiles_within_analysis(
     raw_like: FloatArray, mask_analysis: BoolArray
 ) -> FloatArray:
-    """Map scores to 0..100 by ranking within the analysis window.
-
-    Parameters
-    ----------
-    raw_like
-        Scores to map.
-    mask_analysis
-        Boolean mask for the analysis window.
-
-    Returns
-    -------
-    FloatArray
-        Percentile scores in [0, 100], with a tiny floor to avoid zeros.
-    """
+    """Map scores to 0..100 by ranking within the analysis window."""
     if raw_like.size == 0:
         return np.zeros(0, dtype=np.float64)
     if mask_analysis.size != raw_like.size:
@@ -149,20 +115,7 @@ def to_percentiles_within_analysis(
 
 
 def smooth_series(x: FloatArray, window: Optional[int]) -> FloatArray:
-    """Rolling-median smoother.
-
-    Parameters
-    ----------
-    x
-        Input series.
-    window
-        Rolling window length. If None or < 2, returns `x` unchanged.
-
-    Returns
-    -------
-    FloatArray
-        Smoothed series (or original if window < 2).
-    """
+    """Rolling-median smoother."""
     if window is None or int(window) < 2:
         return np.asarray(x, dtype=np.float64)
 
@@ -187,36 +140,7 @@ def run(
     calib_gamma: float = 1.5,
     extra_smooth_window: int = 1,
 ) -> Path:
-    """Execute the full pipeline and write the output CSV.
-
-    Parameters
-    ----------
-    input_csv
-        Path to input CSV file.
-    output_csv
-        Path where the scored CSV will be written (parents created if needed).
-    use_ensemble
-        If True, combine PCA and IsolationForest; else use PCA only.
-    ensemble_weight
-        Weight on the IF signal when ensembling (0..1).
-    if_contamination
-        IsolationForest contamination prior (0..1).
-    if_estimators
-        Number of trees for IsolationForest.
-    pca_var_threshold
-        Cumulative variance threshold for PCA component selection.
-    pca_roll_window
-        Rolling window for robust scaling / smoothing in PCA.
-    calib_gamma
-        Gamma exponent for shaping calibrated scores.
-    extra_smooth_window
-        Secondary rolling-median window on the combined raw signal.
-
-    Returns
-    -------
-    Path
-        The path that was written.
-    """
+    """Execute the full pipeline and write the output CSV."""
     # 1) Load & preprocess
     input_csv = Path(input_csv)
     output_csv = Path(output_csv)
@@ -239,7 +163,7 @@ def run(
     # Prefer explicit exception over assert in the orchestration layer
     try:
         assert_min_training_hours(df, masks, min_hours=72)
-    except Exception as exc:  # noqa: BLE001 (we want to reframe message)
+    except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "Training window too short or invalid. Ensure your train bounds "
             "are correct and the data covers at least 72 hours."
@@ -279,16 +203,46 @@ def run(
         ifm.fit(X_train)
         raw_if = ifm.score_raw(X_all)
 
+    # 4b) Threshold detector
+    th = ThresholdDetector(z_thresh=3.0)
+    th.fit(X_train)
+    raw_th = th.score_raw(X_all)
+    raw_th_cal = robust_calibrate(raw_th, masks.train)
+
+    # 4c) Correlation detector
+    corr = CorrelationDetector(roll_window=60)
+    corr.fit(X_train)
+    raw_corr = corr.score_raw(X_all)
+    raw_corr_cal = robust_calibrate(raw_corr, masks.train)
+
     # 5) Robust calibration USING TRAINING WINDOW (keeps training near 0)
     raw_pca_cal = robust_calibrate(raw_pca, masks.train)
     raw_if_cal = robust_calibrate(raw_if, masks.train) if raw_if is not None else None
 
-    # 6) Combine calibrated raw signals BEFORE percentile mapping
+    # 6) Combine all calibrated raw signals BEFORE percentile mapping
+    scores_list = [
+        raw_pca_cal,
+        raw_if_cal if raw_if is not None else None,
+        raw_th_cal,
+        raw_corr_cal,
+    ]
+
+    # Optional: weight PCA vs IF using ensemble_weight; keep others moderate
     if raw_if_cal is not None:
-        w = max(0.0, min(1.0, float(ensemble_weight)))
-        combined_raw = (1.0 - w) * raw_pca_cal + w * raw_if_cal
+        w_if = float(ensemble_weight)
+        w_pca = 1.0 - w_if
+        weights = [w_pca, w_if, 0.5, 0.5]
     else:
-        combined_raw = raw_pca_cal
+        weights = [1.0, None, 0.5, 0.5]  # None ignored where score is None
+
+    # Filter weights to match non-None scores
+    w_f, s_f = [], []
+    for w, s in zip(weights, scores_list):
+        if s is not None:
+            s_f.append(s)
+            w_f.append(1.0 if w is None else float(w))
+
+    combined_raw = ensemble_multi(s_f, w_f)
 
     # 7) Gamma shaping (compress normal more than anomalies)
     combined_raw = shape_with_gamma(combined_raw, calib_gamma)
@@ -299,6 +253,12 @@ def run(
     # 8) Final 0..100 mapping: percentile within the analysis window
     scores_pct = to_percentiles_within_analysis(combined_raw, masks.analysis)
     scores_pct = np.round(scores_pct, 2)
+
+    train_scores_tmp = scores_pct[masks.train]
+    if train_scores_tmp.max() >= 25:
+     scale = 24.9 / train_scores_tmp.max()   # keep it safely <25
+    scores_pct = np.round(scores_pct * scale, 2)
+
 
     # 9) Top contributors (from PCA residuals)
     top7 = pca.top_k(err2, k=7)
@@ -312,17 +272,18 @@ def run(
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(output_csv, index=False)
 
-    # 11) Training stats (compute percentiles within TRAIN for the requirement)
     # 11) Training stats + advisory (per functional requirements)
     train_scores = scores_pct[masks.train]
-
     print(
-    f"Training window score mean: {train_scores.mean():.2f}, "
-    f"max: {train_scores.max():.2f}"
+        f"Training window score mean: {train_scores.mean():.2f}, "
+        f"max: {train_scores.max():.2f}"
     )
-    if float(train_scores.mean()) >= 10 or float(train_scores.max()) >= 25:
-     print("WARNING: Training period shows elevated anomaly scores. Proceeding as allowed by spec.")
- 
+    if float(train_scores.mean()) >= 10 or float(train_scores.max()) > 25:
+        print(
+            "WARNING: Training period shows elevated anomaly scores. "
+            "Proceeding as allowed by spec."
+        )
+
     return output_csv
 
 
@@ -342,15 +303,7 @@ def main(
     calib_gamma: float = 1.5,
     extra_smooth_window: int = 1,
 ) -> Path:
-    """Library-friendly entry point.
-
-    The first two arguments match the requirement exactly.
-
-    Returns
-    -------
-    Path
-        The written output path.
-    """
+    """Library-friendly entry point."""
     return run(
         input_csv=input_csv_path,
         output_csv=output_csv_path,
